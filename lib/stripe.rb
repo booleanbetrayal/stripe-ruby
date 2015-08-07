@@ -77,7 +77,7 @@ module Stripe
 
   class << self
     attr_accessor :api_key, :api_base, :verify_ssl_certs, :api_version, :connect_base, :uploads_base,
-                  :open_timeout, :read_timeout
+                  :open_timeout, :read_timeout, :on_successful_retry
   end
 
   def self.api_url(url='', api_base_url=nil)
@@ -135,15 +135,31 @@ module Stripe
                         :method => method, :open_timeout => open_timeout,
                         :payload => payload, :url => url, :timeout => read_timeout)
 
+    response = execute_request_with_rescues(request_opts, api_base_url)
+
+    [parse(response), api_key]
+  end
+
+  def self.max_retries_on_network_failure
+    @max_retries_on_network_failure || 0
+  end
+
+  def self.max_retries_on_network_failure=(val)
+    @max_retries_on_network_failure = val.to_i
+  end
+
+  private
+
+  def self.execute_request_with_rescues(request_opts, api_base_url, retry_count = 0)
     begin
       response = execute_request(request_opts)
     rescue SocketError => e
-      handle_restclient_error(e, api_base_url)
+      response = handle_restclient_error(e, request_opts, retry_count, api_base_url)
     rescue NoMethodError => e
       # Work around RestClient bug
       if e.message =~ /\WRequestFailed\W/
         e = APIConnectionError.new('Unexpected HTTP response code')
-        handle_restclient_error(e, api_base_url)
+        response = handle_restclient_error(e, request_opts, retry_count, api_base_url)
       else
         raise
       end
@@ -151,16 +167,14 @@ module Stripe
       if e.response
         handle_api_error(e.response)
       else
-        handle_restclient_error(e, api_base_url)
+        response = handle_restclient_error(e, request_opts, retry_count, api_base_url)
       end
     rescue RestClient::Exception, Errno::ECONNREFUSED => e
-      handle_restclient_error(e, api_base_url)
+      response = handle_restclient_error(e, request_opts, retry_count, api_base_url)
     end
 
-    [parse(response), api_key]
+    response
   end
-
-  private
 
   def self.user_agent
     @uname ||= get_uname
@@ -222,6 +236,10 @@ module Stripe
       :content_type => 'application/x-www-form-urlencoded'
     }
 
+    # It is only safe to retry network failures if we
+    # add an Idempotency-Key header
+    headers[:idempotency_key] ||= generate_random_idempotency_key if self.max_retries_on_network_failure > 0
+
     headers[:stripe_version] = api_version if api_version
 
     begin
@@ -229,6 +247,15 @@ module Stripe
     rescue => e
       headers.update(:x_stripe_client_raw_user_agent => user_agent.inspect,
                      :error => "#{e} (#{e.class})")
+    end
+  end
+
+  # the build machines run ruby 1.8.7, and so do not have SecureRandom
+  def self.generate_random_idempotency_key
+    if defined? SecureRandom && SecureRandom.respond_to?(:uuid)
+      SecureRandom.uuid
+    else
+      Time.now.to_f.to_s + rand.to_s
     end
   end
 
@@ -303,7 +330,16 @@ module Stripe
     APIError.new(error[:message], resp.code, resp.body, error_obj, resp.headers)
   end
 
-  def self.handle_restclient_error(e, api_base_url=nil)
+  def self.handle_restclient_error(e, request_opts, retry_count, api_base_url=nil)
+    
+    if should_retry?(e, retry_count)
+      response = execute_request_with_rescues(request_opts, api_base_url, retry_count + 1)
+      if self.on_successful_retry
+        self.on_successful_retry.call(e, response)
+      end
+      return response
+    end
+
     api_base_url = @api_base unless api_base_url
     connection_message = "Please check your internet connection and try again. " \
         "If this problem persists, you should check Stripe's service status at " \
@@ -334,6 +370,16 @@ module Stripe
 
     end
 
+    if retry_count > 0
+      message += " Request was retried #{retry_count} times."
+    end
+
     raise APIConnectionError.new(message + "\n\n(Network error: #{e.message})")
+  end
+
+  def self.should_retry?(e, retry_count)
+    return false unless self.max_retries_on_network_failure > retry_count
+    return false if e.is_a?(RestClient::SSLCertificateNotVerified)
+    return true
   end
 end
